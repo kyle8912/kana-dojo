@@ -15,16 +15,17 @@ import {
   applyTheme,
   isPremiumThemeId,
   getThemeDefaultWallpaperId,
-} from '@/features/Preferences/data/themes';
-import { getWallpaperById } from '@/features/Preferences/data/wallpapers';
+} from '@/features/Preferences/data/themes/themes';
+import { getWallpaperById } from '@/features/Preferences/data/wallpapers/wallpapers';
 import BackToTop from '@/shared/components/navigation/BackToTop';
 import MobileBottomBar from '@/shared/components/layout/BottomBar';
 import { useVisitTracker } from '@/features/Progress/hooks/useVisitTracker';
 import { getGlobalAdaptiveSelector } from '@/shared/lib/adaptiveSelection';
 import GlobalAudioController from '@/shared/components/layout/GlobalAudioController';
+import { useClick } from '@/shared/hooks/useAudio';
 import ServiceWorkerRegistration from '@/shared/components/ServiceWorkerRegistration';
-import CursorTrailRenderer from '@/features/Preferences/components/CursorTrailRenderer';
-import ClickEffectRenderer from '@/features/Preferences/components/ClickEffectRenderer';
+import CursorTrailRenderer from '@/features/Preferences/components/renderers/CursorTrailRenderer';
+import ClickEffectRenderer from '@/features/Preferences/components/renderers/ClickEffectRenderer';
 
 // Initialize adaptive selector early to load persisted weights from IndexedDB
 // This runs once at module load time, ensuring weights are ready before games start
@@ -49,7 +50,7 @@ const loadFontsModule = async (): Promise<FontObject[]> => {
   if (fontsCache) return fontsCache;
   if (fontsLoadingPromise) return fontsLoadingPromise;
 
-  fontsLoadingPromise = import('@/features/Preferences/data/fonts').then(
+  fontsLoadingPromise = import('@/features/Preferences/data/fonts/fonts').then(
     module => {
       fontsCache = module.default;
       fontsLoadingPromise = null;
@@ -66,7 +67,14 @@ export default function ClientLayout({
   children: React.ReactNode;
 }>) {
   // Redundant comment for deployment trigger
-  // Trigger redeployment - 2026-02-08
+  // Trigger redeployment - 2026-02-26
+  // Redundant no-op comment to force a fresh Vercel deployment
+  // Force deployment check - v2
+  // Deployment trigger #3
+  // Deployment trigger #4 - keep this harmless no-op comment
+  // Redeploy trigger - redundant whitespaceless comment
+  // Redeploy trigger - second redundant comment to force redeploy (no-op)
+  // Redeploy trigger - third redundant comment to test Vercel Edge outage (March 2, 2026)
   const { theme, font } = usePreferencesStore(
     useShallow(state => ({ theme: state.theme, font: state.font })),
   );
@@ -133,6 +141,32 @@ export default function ClientLayout({
 
   // Track user visits for streak feature
   useVisitTracker();
+
+  // Global typing sound: play click when user types in any input element.
+  // playClick already respects the global silentMode setting via useAudioPreferences,
+  // so the effect re-registers automatically whenever that preference changes.
+  const { playClick } = useClick();
+  useEffect(() => {
+    const IGNORED_KEYS = new Set([
+      'Shift', 'Control', 'Alt', 'Meta', 'Tab', 'Escape', 'Enter',
+      'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+      'Backspace', 'Delete', 'Home', 'End', 'PageUp', 'PageDown', 'CapsLock',
+      'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12',
+    ]);
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.repeat || IGNORED_KEYS.has(e.key)) return;
+      const el = document.activeElement;
+      if (!el) return;
+      const tag = el.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (el as HTMLElement).isContentEditable) {
+        playClick();
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [playClick]);
 
   // Note: Web Audio API context resumption is handled in useAudio.ts
 

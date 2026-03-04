@@ -2,12 +2,14 @@ name: Manage Stale Community Issues
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '30 * * * *'
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: write
   issues: write
+  pull-requests: write
 
 # Prevent race conditions with other community workflows
 concurrency:
@@ -15,19 +17,66 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  backup-guard:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.guard.outputs.should_run }}
+    steps:
+      - name: Decide whether backup run is needed
+        id: guard
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            if (context.eventName !== 'schedule') {
+              core.setOutput('should_run', 'true');
+              return;
+            }
+
+            const maxAgeMs = 90 * 60 * 1000;
+            const workflowId = 'stale-community-issues.yml';
+            const now = Date.now();
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: workflowId,
+              event: 'workflow_dispatch',
+              branch: 'main',
+              per_page: 100,
+            });
+            const recentSuccess = runs.find(function(run) {
+              if (run.status !== 'completed' || run.conclusion !== 'success') {
+                return false;
+              }
+              return (now - Date.parse(run.created_at)) <= maxAgeMs;
+            });
+
+            const shouldRun = recentSuccess ? 'false' : 'true';
+            console.log(
+              recentSuccess
+                ? `Recent workflow_dispatch success found at ${recentSuccess.created_at}; skipping scheduled backup run.`
+                : 'No recent workflow_dispatch success found; running scheduled backup.',
+            );
+            core.setOutput('should_run', shouldRun);
+
   manage-stale:
+    needs: backup-guard
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: github.repository == 'lingdojo/kana-dojo'
+    if: github.repository == 'lingdojo/kana-dojo' && needs.backup-guard.outputs.should_run == 'true'
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.AUTOMATION_PR_TOKEN }}
 
       - name: Process stale community issues
         id: stale-check
         uses: actions/github-script@v7
         with:
+          # Use the workflow-scoped GITHUB_TOKEN for issue mutations.
+          # The external trigger route uses GITHUB_PAT only to dispatch this workflow.
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
@@ -70,7 +119,7 @@ jobs:
             const now = new Date();
             const WARNING_THRESHOLD_MS = templates.config.staleWarningAfterMs;   // 12 hours
             const CLOSE_THRESHOLD_MS = templates.config.staleCloseAfterMs;       // 18 hours
-            const UNASSIGNED_CLOSE_THRESHOLD_MS = 6 * 60 * 60 * 1000; // 6 hours
+            const UNASSIGNED_CLOSE_THRESHOLD_MS = 8 * 60 * 60 * 1000; // 8 hours
 
             let needsCommit = false;
             let themes = JSON.parse(fs.readFileSync(themeBacklogPath, 'utf8'));
@@ -93,12 +142,45 @@ jobs:
             let closedAssigned = 0;
             let warnedUnassigned = 0;
             let closedUnassigned = 0;
+            let apiFailures = 0;
+
+            function isTransientGithubError(error) {
+              const status = Number(error && error.status);
+              const message = String((error && error.message) || '').toLowerCase();
+              const responseData = String((((error || {}).response || {}).data) || '').toLowerCase();
+              return (
+                status >= 500 ||
+                message.includes('unicorn') ||
+                message.includes('<!doctype html>') ||
+                responseData.includes('unicorn') ||
+                responseData.includes('<!doctype html>')
+              );
+            }
+
+            async function runGithubApi(actionLabel, callback, retries = 3) {
+              let lastError;
+              for (let attempt = 1; attempt <= retries; attempt += 1) {
+                try {
+                  return await callback();
+                } catch (error) {
+                  lastError = error;
+                  const transient = isTransientGithubError(error);
+                  if (!transient || attempt === retries) {
+                    throw error;
+                  }
+                  const waitMs = attempt * 1000;
+                  console.log(`${actionLabel} failed on attempt ${attempt}/${retries}; retrying in ${waitMs}ms. Error: ${error.message}`);
+                  await new Promise(function(resolve) { setTimeout(resolve, waitMs); });
+                }
+              }
+              throw lastError;
+            }
 
             function reenableBacklogItem(title, sourceLabel) {
               const sourceTag = sourceLabel ? ` (${sourceLabel})` : '';
-              if (title.includes('Add New Color Theme:')) {
-                // Extract theme name from title like: "[Good First Issue] 🎨 Add New Color Theme: Neon Sakura (good first issue)"
-                const themeMatch = title.match(/Add New Color Theme:\s*(.+?)\s*\(good first issue\)/i);
+              if (title.includes('Add New Color Theme:') || title.includes('Add Theme:')) {
+                // Extract theme name from title (old and new format)
+                const themeMatch = title.match(/Add (?:New Color )?Theme:\s*(.+?)\s*(?:—|\(good)/i);
                 if (themeMatch) {
                   const themeName = themeMatch[1].trim();
                   const themeIndex = themes.findIndex(function(t) { return t.name === themeName; });
@@ -110,7 +192,7 @@ jobs:
                     console.log(`Theme "${themeName}" is already completed, not re-enabling`);
                   }
                 }
-              } else if (title.includes('Add Japan Fact #')) {
+              } else if (title.includes('Add Japan Fact #') || title.includes('Add new Japan Fact #')) {
                 const factIdMatch = title.match(/#(\d+)/);
                 if (factIdMatch) {
                   const factId = parseInt(factIdMatch[1]);
@@ -123,7 +205,7 @@ jobs:
                     console.log(`Fact #${factId} is already completed, not re-enabling`);
                   }
                 }
-              } else if (title.includes('Add Japanese Proverb #')) {
+              } else if (title.includes('Add Japanese Proverb #') || title.includes('Add new Japanese Proverb #')) {
                 const proverbIdMatch = title.match(/#(\d+)/);
                 if (proverbIdMatch) {
                   const proverbId = parseInt(proverbIdMatch[1]);
@@ -136,7 +218,7 @@ jobs:
                     console.log(`Proverb #${proverbId} is already completed, not re-enabling`);
                   }
                 }
-              } else if (title.includes('Add Classic Japanese Haiku #')) {
+              } else if (title.includes('Add Classic Japanese Haiku #') || title.includes('Add Japanese Haiku #') || title.includes('Add new Japanese Haiku #')) {
                 const haikuIdMatch = title.match(/#(\d+)/);
                 if (haikuIdMatch) {
                   const haikuId = parseInt(haikuIdMatch[1]);
@@ -149,7 +231,7 @@ jobs:
                     console.log(`Haiku #${haikuId} is already completed, not re-enabling`);
                   }
                 }
-              } else if (title.includes('Add New Trivia Question #')) {
+              } else if (title.includes('Add New Trivia Question #') || title.includes('Add Trivia Question #') || title.includes('Add new Trivia Question #')) {
                 const triviaIdMatch = title.match(/#(\d+)/);
                 if (triviaIdMatch) {
                   const triviaId = parseInt(triviaIdMatch[1]);
@@ -162,7 +244,7 @@ jobs:
                     console.log(`Trivia #${triviaId} is already completed, not re-enabling`);
                   }
                 }
-              } else if (title.includes('Add New Grammar Point #')) {
+              } else if (title.includes('Add New Grammar Point #') || title.includes('Add Grammar Point #') || title.includes('Add new Grammar Point #')) {
                 const grammarIdMatch = title.match(/#(\d+)/);
                 if (grammarIdMatch) {
                   const grammarId = parseInt(grammarIdMatch[1]);
@@ -175,7 +257,7 @@ jobs:
                     console.log(`Grammar #${grammarId} is already completed, not re-enabling`);
                   }
                 }
-              } else if (title.includes('Add Famous Anime Quote #')) {
+              } else if (title.includes('Add Famous Anime Quote #') || title.includes('Add Anime Quote #') || title.includes('Add new Anime Quote #')) {
                 const quoteIdMatch = title.match(/#(\d+)/);
                 if (quoteIdMatch) {
                   const quoteId = parseInt(quoteIdMatch[1]);
@@ -188,7 +270,7 @@ jobs:
                     console.log(`Anime quote #${quoteId} is already completed, not re-enabling`);
                   }
                 }
-              } else if (title.includes('Add New Japanese Idiom #')) {
+              } else if (title.includes('Add New Japanese Idiom #') || title.includes('Add Japanese Idiom #') || title.includes('Add new Japanese Idiom #')) {
                 const idiomIdMatch = title.match(/#(\d+)/);
                 if (idiomIdMatch) {
                   const idiomId = parseInt(idiomIdMatch[1]);
@@ -201,7 +283,7 @@ jobs:
                     console.log(`Idiom #${idiomId} is already completed, not re-enabling`);
                   }
                 }
-              } else if (title.includes('Add Regional Dialect Entry #')) {
+              } else if (title.includes('Add Regional Dialect Entry #') || title.includes('Add Dialect Entry #') || title.includes('Add new Dialect Entry #')) {
                 const dialectIdMatch = title.match(/#(\d+)/);
                 if (dialectIdMatch) {
                   const dialectId = parseInt(dialectIdMatch[1]);
@@ -214,7 +296,7 @@ jobs:
                     console.log(`Regional dialect #${dialectId} is already completed, not re-enabling`);
                   }
                 }
-              } else if (title.includes('Add Japanese False Friend #')) {
+              } else if (title.includes('Add Japanese False Friend #') || title.includes('Add False Friend Pair #') || title.includes('Add new False Friend Pair #')) {
                 const idMatch = title.match(/#(\d+)/);
                 if (idMatch) {
                   const id = parseInt(idMatch[1]);
@@ -227,7 +309,7 @@ jobs:
                     console.log(`False friend #${id} is already completed, not re-enabling`);
                   }
                 }
-              } else if (title.includes('Add Japanese Cultural Etiquette Tip #')) {
+              } else if (title.includes('Add Japanese Cultural Etiquette Tip #') || title.includes('Add Etiquette Tip #') || title.includes('Add new Etiquette Tip #')) {
                 const idMatch = title.match(/#(\d+)/);
                 if (idMatch) {
                   const id = parseInt(idMatch[1]);
@@ -240,7 +322,7 @@ jobs:
                     console.log(`Cultural etiquette #${id} is already completed, not re-enabling`);
                   }
                 }
-              } else if (title.includes('Add Japanese Example Sentence #')) {
+              } else if (title.includes('Add Japanese Example Sentence #') || title.includes('Add Example Sentence #') || title.includes('Add new Example Sentence #')) {
                 const idMatch = title.match(/#(\d+)/);
                 if (idMatch) {
                   const id = parseInt(idMatch[1]);
@@ -253,7 +335,7 @@ jobs:
                     console.log(`Example sentence #${id} is already completed, not re-enabling`);
                   }
                 }
-              } else if (title.includes('Add Common Japanese Learner Mistake #')) {
+              } else if (title.includes('Add Common Japanese Learner Mistake #') || title.includes('Add Learner Mistake #') || title.includes('Add new Learner Mistake #')) {
                 const idMatch = title.match(/#(\d+)/);
                 if (idMatch) {
                   const id = parseInt(idMatch[1]);
@@ -266,7 +348,7 @@ jobs:
                     console.log(`Common mistake #${id} is already completed, not re-enabling`);
                   }
                 }
-              } else if (title.includes('Add Famous Japanese Video Game Quote #')) {
+              } else if (title.includes('Add Famous Japanese Video Game Quote #') || title.includes('Add Video Game Quote #') || title.includes('Add new Video Game Quote #')) {
                 const idMatch = title.match(/#(\d+)/);
                 if (idMatch) {
                   const id = parseInt(idMatch[1]);
@@ -290,15 +372,21 @@ jobs:
               if (!issue.assignees || issue.assignees.length === 0) {
                 if (timeSinceActivity >= UNASSIGNED_CLOSE_THRESHOLD_MS) {
                   console.log(`Closing stale unassigned issue #${issue.number}: ${issue.title}`);
-                  closedUnassigned += 1;
-
-                  await github.rest.issues.update({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    issue_number: issue.number,
-                    state: 'closed',
-                    state_reason: 'completed'
-                  });
+                  try {
+                    await runGithubApi(`close-unassigned-issue-${issue.number}`, function() {
+                      return github.rest.issues.update({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        issue_number: issue.number,
+                        state: 'closed',
+                        state_reason: 'not_planned'
+                      });
+                    });
+                    closedUnassigned += 1;
+                  } catch (error) {
+                    apiFailures += 1;
+                    console.log(`Could not close unassigned issue #${issue.number}: ${error.message}`);
+                  }
                 } else {
                   // Leave unassigned issues quiet until auto-close to avoid noisy bot comments
                   skippedUnassigned += 1;
@@ -308,57 +396,74 @@ jobs:
 
               if (timeSinceActivity >= CLOSE_THRESHOLD_MS) {
                 console.log(`Closing stale issue #${issue.number}: ${issue.title}`);
-                closedAssigned += 1;
                 
                 // Unassign the user before closing
                 const assignees = issue.assignees.map(function(a) { return a.login; });
                 if (assignees.length > 0) {
                   try {
-                    await github.rest.issues.removeAssignees({
-                      owner: context.repo.owner,
-                      repo: context.repo.repo,
-                      issue_number: issue.number,
-                      assignees: assignees
+                    await runGithubApi(`unassign-issue-${issue.number}`, function() {
+                      return github.rest.issues.removeAssignees({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        issue_number: issue.number,
+                        assignees: assignees
+                      });
                     });
                     console.log(`Unassigned ${assignees.join(', ')} from issue #${issue.number}`);
                   } catch (error) {
                     // Continue stale cleanup even if assignee removal races or fails for one issue
+                    apiFailures += 1;
                     console.log(`Could not unassign issue #${issue.number}: ${error.message}`);
                   }
                 }
-                
-                await github.rest.issues.update({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: issue.number,
-                  state: 'closed',
-                  state_reason: 'completed'
-                });
-
-                reenableBacklogItem(issue.title, 'assigned-stale-close');
+                try {
+                  await runGithubApi(`close-assigned-issue-${issue.number}`, function() {
+                    return github.rest.issues.update({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number,
+                      state: 'closed',
+                      state_reason: 'completed'
+                    });
+                  });
+                  closedAssigned += 1;
+                  reenableBacklogItem(issue.title, 'assigned-stale-close');
+                } catch (error) {
+                  apiFailures += 1;
+                  console.log(`Could not close assigned issue #${issue.number}: ${error.message}`);
+                }
                 
               } else if (timeSinceActivity >= WARNING_THRESHOLD_MS && !hasWarning) {
                 console.log(`Adding warning to issue #${issue.number}`);
-                warnedAssigned += 1;
-                
+
                 const warningMsg = t.warning;
-                await github.rest.issues.createComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: issue.number,
-                  body: `${warningMsg.greeting} ${warningMsg.body}\n\n${warningMsg.action}\n\n${warningMsg.consequence}\n\n${warningMsg.footer}`
-                });
-                
-                await github.rest.issues.addLabels({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: issue.number,
-                  labels: [templates.labels.staleWarning]
-                });
+                try {
+                  await runGithubApi(`warn-comment-issue-${issue.number}`, function() {
+                    return github.rest.issues.createComment({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number,
+                      body: `${warningMsg.greeting} ${warningMsg.body}\n\n${warningMsg.action}\n\n${warningMsg.consequence}\n\n${warningMsg.footer}`
+                    });
+                  });
+
+                  await runGithubApi(`warn-label-issue-${issue.number}`, function() {
+                    return github.rest.issues.addLabels({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number,
+                      labels: [templates.labels.staleWarning]
+                    });
+                  });
+                  warnedAssigned += 1;
+                } catch (error) {
+                  apiFailures += 1;
+                  console.log(`Could not warn issue #${issue.number}: ${error.message}`);
+                }
               }
             }
 
-            console.log(`Stale issue summary: total=${issues.length}, skipped_unassigned=${skippedUnassigned}, warned_assigned=${warnedAssigned}, closed_assigned=${closedAssigned}, warned_unassigned=${warnedUnassigned}, closed_unassigned=${closedUnassigned}`);
+            console.log(`Stale issue summary: total=${issues.length}, skipped_unassigned=${skippedUnassigned}, warned_assigned=${warnedAssigned}, closed_assigned=${closedAssigned}, warned_unassigned=${warnedUnassigned}, closed_unassigned=${closedUnassigned}, api_failures=${apiFailures}`);
 
             if (needsCommit) {
               fs.writeFileSync(themeBacklogPath, JSON.stringify(themes, null, 2));
@@ -380,15 +485,35 @@ jobs:
               core.setOutput('needs_commit', 'false');
             }
 
-      - name: Commit backlog updates
+      - name: Commit backlog updates directly to main
         if: steps.stale-check.outputs.needs_commit == 'true'
         run: |
+          git config user.name "てんとう虫"
+          git config user.email "reservecrate@gmail.com"
           git add community/backlog/
           if git diff --cached --quiet; then
-            echo "No backlog changes to commit."
+            echo "No backlog changes to commit"
             exit 0
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore(automation): re-enable stale items in backlog"
-          git push
+          commit_msg="chore(automation): re-enable stale items in backlog"
+          max_attempts=5
+          attempt=1
+          while [ "$attempt" -le "$max_attempts" ]; do
+            git commit -m "$commit_msg"
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              echo "Backlog push succeeded on attempt $attempt"
+              exit 0
+            fi
+            echo "Backlog push attempt $attempt failed; retrying..."
+            git rebase --abort || true
+            git fetch origin main
+            git reset --hard origin/main
+            git add community/backlog/
+            if git diff --cached --quiet; then
+              echo "No backlog changes remain after sync"
+              exit 0
+            fi
+            attempt=$((attempt + 1))
+          done
+          echo "Failed to push backlog updates after $max_attempts attempts"
+          exit 1

@@ -41,7 +41,7 @@ const validSyncKey = 'sync-key-1234567890';
 const validBody = {
   updatedAt: '2026-02-20T12:00:00.000Z',
   snapshot: {
-    version: '0.1.14',
+    version: '0.1.15',
     createdAt: '2026-02-20T12:00:00.000Z',
     stats: { totalCorrect: 42 },
   },

@@ -1,4 +1,4 @@
-import fonts from '@/features/Preferences/data/fonts';
+import fonts from '@/features/Preferences/data/fonts/fonts';
 import clsx from 'clsx';
 //sandbox
 

@@ -71,7 +71,7 @@ const Subset = ({ sliceRange, subgroup }: SubsetProps) => {
               className={clsx(
                 'flex w-full flex-row items-center gap-2',
                 'transition-all duration-200 ease-in-out',
-                'text-(--secondary-color)',
+                'text-(--secondary-color) hover:text-(--main-color)',
               )}
               onClick={playClick}
             >

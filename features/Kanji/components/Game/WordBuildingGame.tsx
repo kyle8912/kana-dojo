@@ -24,6 +24,7 @@ import {
   useWordBuildingActionKey,
 } from '@/shared/components/Game/wordBuildingShared';
 import WordBuildingTilesGrid from '@/shared/components/Game/WordBuildingTilesGrid';
+import useClassicSessionStore from '@/shared/store/useClassicSessionStore';
 
 const random = new Random();
 const adaptiveSelector = getGlobalAdaptiveSelector();
@@ -50,6 +51,7 @@ const KanjiWordBuildingGame = ({
   onCorrect: externalOnCorrect,
   onWrong: externalOnWrong,
 }: KanjiWordBuildingGameProps) => {
+  const logAttempt = useClassicSessionStore(state => state.logAttempt);
   // Smart reverse mode - used when not controlled externally
   const {
     isReverse: internalIsReverse,
@@ -117,7 +119,7 @@ const KanjiWordBuildingGame = ({
   // Generate question: 1 kanji with multiple answer options
   const generateQuestion = useCallback(() => {
     if (selectedKanjiObjs.length === 0) {
-      return { kanjiChar: '', correctAnswer: '', allTiles: [] };
+      return { kanjiChar: '', correctAnswer: '', allTiles: new Map() };
     }
 
     // Select a kanji using adaptive selection
@@ -127,7 +129,7 @@ const KanjiWordBuildingGame = ({
 
     const selectedKanjiObj = kanjiObjMap.get(selectedKanji);
     if (!selectedKanjiObj) {
-      return { kanjiChar: '', correctAnswer: '', allTiles: [] };
+      return { kanjiChar: '', correctAnswer: '', allTiles: new Map() };
     }
 
     // In normal mode: show kanji, answer with meaning
@@ -150,9 +152,13 @@ const KanjiWordBuildingGame = ({
       .slice(0, distractorCount);
 
     // Shuffle all tiles
-    const allTiles = [correctAnswer, ...distractors].sort(
+    const sortedTiles = [correctAnswer, ...distractors].sort(
       () => random.real(0, 1) - 0.5,
     );
+    const allTiles = new Map<number, string>();
+    sortedTiles.forEach((char, i) => {
+      allTiles.set(i, char);
+    });
 
     return {
       kanjiChar: selectedKanji,
@@ -163,7 +169,7 @@ const KanjiWordBuildingGame = ({
   }, [isReverse, selectedKanjiObjs, distractorCount, kanjiObjMap]);
 
   const [questionData, setQuestionData] = useState(() => generateQuestion());
-  const [placedTiles, setPlacedTiles] = useState<string[]>([]);
+  const [placedTileIds, setPlacedTileIds] = useState<number[]>([]);
   const [isChecking, setIsChecking] = useState(false);
   const [isCelebrating, setIsCelebrating] = useState(false);
   const [displayAnswerSummary, setDisplayAnswerSummary] = useState(false);
@@ -176,7 +182,7 @@ const KanjiWordBuildingGame = ({
   const resetGame = useCallback(() => {
     const newQuestion = generateQuestion();
     setQuestionData(newQuestion);
-    setPlacedTiles([]);
+    setPlacedTileIds([]);
     setIsChecking(false);
     setIsCelebrating(false);
     setBottomBarState('check');
@@ -202,7 +208,7 @@ const KanjiWordBuildingGame = ({
 
   // Handle Check button
   const handleCheck = useCallback(() => {
-    if (placedTiles.length === 0) return;
+    if (placedTileIds.length === 0) return;
 
     // Stop timing and record answer time
     speedStopwatch.pause();
@@ -212,8 +218,10 @@ const KanjiWordBuildingGame = ({
     setIsChecking(true);
 
     // Correct if exactly one tile placed and it matches the correct answer
+    const selectedTileChar = questionData.allTiles.get(placedTileIds[0]);
     const isCorrect =
-      placedTiles.length === 1 && placedTiles[0] === questionData.correctAnswer;
+      placedTileIds.length === 1 &&
+      selectedTileChar === questionData.correctAnswer;
 
     if (isCorrect) {
       // Record answer time for speed achievements
@@ -253,6 +261,17 @@ const KanjiWordBuildingGame = ({
       if (externalIsReverse === undefined) {
         decideNextReverseMode();
       }
+      logAttempt({
+        questionId: questionData.kanjiChar,
+        questionPrompt: String(questionData.displayChar ?? questionData.kanjiChar),
+        expectedAnswers: [questionData.correctAnswer],
+        userAnswer: String(selectedTileChar ?? ''),
+        inputKind: 'word_building',
+        isCorrect: true,
+        timeTakenMs: answerTimeMs,
+        optionsShown: Array.from(questionData.allTiles.values()),
+        extra: { isReverse },
+      });
     } else {
       speedStopwatch.reset();
       playErrorTwice();
@@ -275,9 +294,19 @@ const KanjiWordBuildingGame = ({
       }
 
       externalOnWrong?.();
+      logAttempt({
+        questionId: questionData.kanjiChar,
+        questionPrompt: String(questionData.displayChar ?? questionData.kanjiChar),
+        expectedAnswers: [questionData.correctAnswer],
+        userAnswer: String(selectedTileChar ?? ''),
+        inputKind: 'word_building',
+        isCorrect: false,
+        optionsShown: Array.from(questionData.allTiles.values()),
+        extra: { isReverse },
+      });
     }
   }, [
-    placedTiles,
+    placedTileIds,
     questionData,
     playClick,
     playCorrect,
@@ -297,6 +326,8 @@ const KanjiWordBuildingGame = ({
     externalIsReverse,
     decideNextReverseMode,
     recordReverseModeWrong,
+    logAttempt,
+    isReverse,
     addCorrectAnswerTime,
     recordAnswerTime,
   ]);
@@ -312,7 +343,7 @@ const KanjiWordBuildingGame = ({
   // Handle Try Again button (for wrong answers)
   const handleTryAgain = useCallback(() => {
     playClick();
-    setPlacedTiles([]);
+    setPlacedTileIds([]);
     setIsChecking(false);
     setBottomBarState('check');
     speedStopwatch.reset();
@@ -321,7 +352,7 @@ const KanjiWordBuildingGame = ({
 
   // Handle tile click - add or remove from placed tiles
   const handleTileClick = useCallback(
-    (char: string) => {
+    (id: number, _char: string) => {
       if (isChecking && bottomBarState !== 'wrong') return;
 
       playClick();
@@ -334,14 +365,13 @@ const KanjiWordBuildingGame = ({
         speedStopwatch.start();
       }
 
-      // Toggle tile in placed tiles array
-      if (placedTiles.includes(char)) {
-        setPlacedTiles(prev => prev.filter(c => c !== char));
-      } else {
-        setPlacedTiles(prev => [...prev, char]);
-      }
+      setPlacedTileIds(prevIds =>
+        prevIds.includes(id)
+          ? prevIds.filter(tileId => tileId !== id)
+          : [...prevIds, id],
+      );
     },
-    [isChecking, bottomBarState, placedTiles, playClick],
+    [isChecking, bottomBarState, playClick],
   );
 
   // Not enough characters
@@ -349,7 +379,7 @@ const KanjiWordBuildingGame = ({
     return null;
   }
 
-  const canCheck = placedTiles.length > 0 && !isChecking;
+  const canCheck = placedTileIds.length > 0 && !isChecking;
   const showContinue = bottomBarState === 'correct';
   const showTryAgain = bottomBarState === 'wrong';
 
@@ -426,7 +456,7 @@ const KanjiWordBuildingGame = ({
 
             <WordBuildingTilesGrid
               allTiles={questionData.allTiles}
-              placedTiles={placedTiles}
+              placedTileIds={placedTileIds}
               onTileClick={handleTileClick}
               isTileDisabled={isChecking && bottomBarState !== 'wrong'}
               isCelebrating={isCelebrating}

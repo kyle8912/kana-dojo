@@ -173,7 +173,9 @@ const NavLink = memo(
 
       // Padding adjustment for ActionButton style (compensate for border)
       const paddingClasses = USE_ACTION_BUTTON_STYLE
-        ? 'max-lg:pt-1 max-lg:pb-2.5 lg:pt-2 lg:pb-3'
+        ? isMain
+          ? 'max-lg:pt-1 max-lg:pb-2.5 lg:pt-2 lg:pb-3'
+          : 'max-lg:pt-1 max-lg:pb-2.5 lg:pt-1.5 lg:pb-2.5'
         : 'max-lg:py-2 lg:py-2';
 
       return (
@@ -205,7 +207,9 @@ const NavLink = memo(
                 : 'text-(--secondary-color) hover:bg-(--card-color)',
             )}
           >
-            {renderIcon()}
+            <span className={clsx(!isActive && 'lg:text-(--main-color)')}>
+              {renderIcon()}
+            </span>
             <span className={isMain ? 'max-lg:hidden' : undefined}>
               {item.label}
             </span>
@@ -284,9 +288,9 @@ const SectionHeader = ({
         className='mt-3 flex w-full cursor-pointer items-center gap-1 px-4 text-xs text-(--main-color) uppercase opacity-70 transition-opacity hover:opacity-100 max-lg:hidden'
       >
         {isExpanded ? (
-          <ChevronDown className='h-3 w-3' />
+          <ChevronDown className='h-3 w-3 text-(--secondary-color)' />
         ) : (
-          <ChevronRight className='h-3 w-3' />
+          <ChevronRight className='h-3 w-3 text-(--secondary-color)' />
         )}
         {title}
       </button>
@@ -562,17 +566,20 @@ const Sidebar = () => {
               onToggle={onToggle}
             />
             {/* Only show items if section is expanded or not collapsible */}
-            {(!section.collapsible || isExpanded) &&
-              section.items.map(item => (
-                <NavLink
-                  key={item.href}
-                  item={item}
-                  isActive={isActive(item.href)}
-                  onClick={playClick}
-                  variant='secondary'
-                  useSlidingIndicator={true}
-                />
-              ))}
+            {(!section.collapsible || isExpanded) && section.items.length > 0 && (
+              <div className='flex w-full flex-col gap-0 max-lg:hidden'>
+                {section.items.map(item => (
+                  <NavLink
+                    key={item.href}
+                    item={item}
+                    isActive={isActive(item.href)}
+                    onClick={playClick}
+                    variant='secondary'
+                    useSlidingIndicator={true}
+                  />
+                ))}
+              </div>
+            )}
           </div>
         );
       })}

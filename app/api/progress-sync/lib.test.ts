@@ -11,7 +11,7 @@ import {
 const validSyncBody = {
   updatedAt: '2026-02-20T12:00:00.000Z',
   snapshot: {
-    version: '0.1.14',
+    version: '0.1.15',
     createdAt: '2026-02-20T12:00:00.000Z',
     stats: { totalCorrect: 123 },
   },
@@ -80,7 +80,7 @@ describe('progress-sync/lib', () => {
       const result = validateProgressSyncRequestBody({
         ...validSyncBody,
         snapshot: {
-          version: '0.1.14',
+          version: '0.1.15',
           createdAt: '2026-02-20T12:00:00.000Z',
         },
       });

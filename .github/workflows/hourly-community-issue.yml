@@ -2,7 +2,7 @@ name: Create Community Contribution Issue
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       force_type:
@@ -15,29 +15,78 @@ on:
         type: boolean
 
 permissions:
+  actions: read
   contents: write
   issues: write
+  pull-requests: write
 
 # Prevent multiple runs from overlapping and causing race conditions
 concurrency:
   group: community-issue-creation
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
+  backup-guard:
+    runs-on: ubuntu-24.04
+    outputs:
+      should_run: ${{ steps.guard.outputs.should_run }}
+    steps:
+      - name: Decide whether backup run is needed
+        id: guard
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.AUTOMATION_PR_TOKEN || secrets.GITHUB_TOKEN }}
+          script: |
+            if (context.eventName !== 'schedule') {
+              core.setOutput('should_run', 'true');
+              return;
+            }
+
+            const maxAgeMs = 45 * 60 * 1000;
+            const workflowId = 'hourly-community-issue.yml';
+            const now = Date.now();
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: workflowId,
+              event: 'workflow_dispatch',
+              branch: 'main',
+              per_page: 100,
+            });
+            const recentSuccess = runs.find(function(run) {
+              if (run.status !== 'completed' || run.conclusion !== 'success') {
+                return false;
+              }
+              return (now - Date.parse(run.created_at)) <= maxAgeMs;
+            });
+
+            const shouldRun = recentSuccess ? 'false' : 'true';
+            console.log(
+              recentSuccess
+                ? `Recent workflow_dispatch success found at ${recentSuccess.created_at}; skipping scheduled backup run.`
+                : 'No recent workflow_dispatch success found; running scheduled backup.',
+            );
+            core.setOutput('should_run', shouldRun);
+
   create-issue:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    if: github.repository == 'lingdojo/kana-dojo'
+    needs: backup-guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    if: github.repository == 'lingdojo/kana-dojo' && needs.backup-guard.outputs.should_run == 'true'
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.AUTOMATION_PR_TOKEN }}
+          ref: main
+          fetch-depth: 0
 
       - name: Create community issue
         id: create-issue
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.AUTOMATION_PR_TOKEN || secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
             const templates = require('./.github/templates/messages.cjs');
@@ -49,26 +98,6 @@ jobs:
 
             function pickEmoji() {
               return emojiBank[Math.floor(Math.random() * emojiBank.length)];
-            }
-
-            function pickTwoAdjectives(adjectives) {
-              const fallback = ['helpful', 'friendly', 'quick', 'clear', 'creative'];
-              const pool = Array.isArray(adjectives) && adjectives.length > 0 ? adjectives : fallback;
-              const first = pool[Math.floor(Math.random() * pool.length)];
-              let second = pool[Math.floor(Math.random() * pool.length)];
-
-              if (pool.length > 1) {
-                while (second === first) {
-                  second = pool[Math.floor(Math.random() * pool.length)];
-                }
-              }
-
-              return [first, second];
-            }
-
-            function addTitleAdjectives(title, adjectives) {
-              const [first, second] = pickTwoAdjectives(adjectives);
-              return String(title).replace(' Add ', ` Add ${first}, ${second} `);
             }
 
             function findRandomEligible(items, predicate) {
@@ -393,16 +422,13 @@ jobs:
               
               const tmpl = t.theme;
               const common = t.common;
-              issueTitle = tmpl.title
-                .replace('{emoji}', pickEmoji())
-                .replace('{name}', item.name);
-              issueTitle = addTitleAdjectives(issueTitle, tmpl.adjectives);
+              issueTitle = t.buildIssueTitle(pickEmoji(), tmpl.title.replace('{name}', item.name));
               
               const instructions = t.buildInstructions(tmpl.file, tmpl.itemType, tmpl.prTitle, { step2: tmpl.step2, step3: tmpl.step3 }).map((instr, i) => `${i + 1}. ${instr.replace(/{name}/g, item.name)}`);
               
               const codeBlock = `\`\`\`typescript\n{\n  id: '${item.id}',\n  backgroundColor: '${item.backgroundColor}',\n  mainColor: '${item.mainColor}',\n  secondaryColor: '${item.secondaryColor}'\n},\n\`\`\``;
               
-              issueBody = `${tmpl.header.replace('{name}', item.name)}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### 🎯 Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.detailsHeader}\n\n| Property | Value |\n|----------|-------|\n| **ID** | \`${item.id}\` |\n| **Background** | \`${item.backgroundColor}\` |\n| **Main Color** | \`${item.mainColor}\` |\n| **Secondary** | \`${item.secondaryColor}\` |\n\n> ${tmpl.vibeLabel} ${item.description}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 5).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(5).join('\n')}\n\n---\n\n${common.footer}`;
+              issueBody = `${tmpl.header.replace('{name}', item.name)}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### 🎯 Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.detailsHeader}\n\n| Property | Value |\n|----------|-------|\n| **ID** | \`${item.id}\` |\n| **Background** | \`${item.backgroundColor}\` |\n| **Main Color** | \`${item.mainColor}\` |\n| **Secondary** | \`${item.secondaryColor}\` |\n\n> ${tmpl.vibeLabel} ${item.description}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 4).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(4).join('\n')}\n\n---\n\n${common.footer}`;
               
               const themeIndex = themes.findIndex(function(th) { return th.id === item.id; });
               themes[themeIndex].issued = true;
@@ -449,14 +475,11 @@ jobs:
               
               const tmpl = t.fact;
               const common = t.common;
-              issueTitle = tmpl.title
-                .replace('{emoji}', pickEmoji())
-                .replace('{id}', item.id);
-              issueTitle = addTitleAdjectives(issueTitle, tmpl.adjectives);
+              issueTitle = t.buildIssueTitle(pickEmoji(), tmpl.title.replace('{id}', item.id));
               
               const instructions = t.buildInstructions(tmpl.file, tmpl.itemType, tmpl.prTitle).map((instr, i) => `${i + 1}. ${instr.replace(/{id}/g, item.id)}`);
-              
-              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### 🎯 Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.factHeader}\n\n> ${item.fact}\n\n${common.instructionsHeader}\n\n${instructions.join('\n')}\n\n---\n\n${common.footer}`;
+              const codeBlock = `\`\`\`json\n"${item.fact}"\n\`\`\``;
+              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### 🎯 Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.factHeader}\n\n> ${item.fact}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 4).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(4).join('\n')}\n\n---\n\n${common.footer}`;
               
               const factIndex = facts.findIndex(function(f) { return f.id === item.id; });
               facts[factIndex].issued = true;
@@ -510,16 +533,13 @@ jobs:
               
               const tmpl = t.proverb;
               const common = t.common;
-              issueTitle = tmpl.title
-                .replace('{emoji}', pickEmoji())
-                .replace('{id}', item.id);
-              issueTitle = addTitleAdjectives(issueTitle, tmpl.adjectives);
+              issueTitle = t.buildIssueTitle(pickEmoji(), tmpl.title.replace('{id}', item.id));
               
               const instructions = t.buildInstructions(tmpl.file, tmpl.itemType, tmpl.prTitle).map((instr, i) => `${i + 1}. ${instr.replace(/{id}/g, item.id)}`);
               
               const codeBlock = `\`\`\`json\n{\n  "japanese": "${item.japanese}",\n  "romaji": "${item.romaji}",\n  "english": "${item.english}",\n  "meaning": "${item.meaning}"\n}\n\`\`\``;
               
-              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### 🎯 Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.proverbHeader}\n\n| Japanese | Reading | English |\n|----------|---------|---------|\n| **${item.japanese}** | ${item.romaji} | ${item.english} |\n\n> 💡 **Meaning:** ${item.meaning}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 5).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(5).join('\n')}\n\n---\n\n${common.footer}`;
+              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### 🎯 Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.proverbHeader}\n\n| Japanese | Reading | English |\n|----------|---------|---------|\n| **${item.japanese}** | ${item.romaji} | ${item.english} |\n\n> 💡 **Meaning:** ${item.meaning}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 4).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(4).join('\n')}\n\n---\n\n${common.footer}`;
               
               const proverbIndex = proverbs.findIndex(function(p) { return p.id === item.id; });
               proverbs[proverbIndex].issued = true;
@@ -567,15 +587,12 @@ jobs:
 
               const tmpl = t.haiku;
               const common = t.common;
-              issueTitle = tmpl.title
-                .replace('{emoji}', pickEmoji())
-                .replace('{id}', item.id);
-              issueTitle = addTitleAdjectives(issueTitle, tmpl.adjectives);
+              issueTitle = t.buildIssueTitle(pickEmoji(), tmpl.title.replace('{id}', item.id));
 
               const instructions = t.buildInstructions(tmpl.file, tmpl.itemType, tmpl.prTitle).map((instr, i) => `${i + 1}. ${instr.replace(/{id}/g, item.id)}`);
               const codeBlock = `\`\`\`json\n{\n  "japanese": "${item.japanese}",\n  "romaji": "${item.romaji}",\n  "english": "${item.english}",\n  "poet": "${item.poet}",\n  "season": "${item.season}",\n  "kigo": "${item.kigo}",\n  "notes": "${item.notes}"\n}\n\`\`\``;
 
-              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.haikuHeader}\n\n> ${item.japanese.replace(/\n/g, '\n> ')}\n\n**Romaji:** ${item.romaji}  \n**English:** ${item.english}  \n**Poet:** ${item.poet}  \n**Season:** ${item.season}  \n**Kigo:** ${item.kigo}  \n**Notes:** ${item.notes}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 5).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(5).join('\n')}\n\n---\n\n${common.footer}`;
+              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.haikuHeader}\n\n> ${item.japanese.replace(/\n/g, '\n> ')}\n\n**Romaji:** ${item.romaji}  \n**English:** ${item.english}  \n**Poet:** ${item.poet}  \n**Season:** ${item.season}  \n**Kigo:** ${item.kigo}  \n**Notes:** ${item.notes}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 4).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(4).join('\n')}\n\n---\n\n${common.footer}`;
 
               const haikuIndex = haiku.findIndex(function(h) { return h.id === item.id; });
               haiku[haikuIndex].issued = true;
@@ -635,17 +652,14 @@ jobs:
 
               const tmpl = t.trivia;
               const common = t.common;
-              issueTitle = tmpl.title
-                .replace('{emoji}', pickEmoji())
-                .replace('{id}', item.id);
-              issueTitle = addTitleAdjectives(issueTitle, tmpl.adjectives);
+              issueTitle = t.buildIssueTitle(pickEmoji(), tmpl.title.replace('{id}', item.id));
 
               const difficultyFile = triviaSourcePaths[item.difficulty] || triviaSourcePaths.easy;
               const instructions = t.buildInstructions(tmpl.file.replace('{difficultyFile}', difficultyFile), tmpl.itemType, tmpl.prTitle).map((instr, i) => `${i + 1}. ${instr.replace(/{id}/g, item.id)}`);
               const answers = Array.isArray(item.answers) ? item.answers : [];
               const codeBlock = `\`\`\`json\n{\n  "question": "${item.question}",\n  "difficulty": "${item.difficulty}",\n  "answers": [\n    "${answers.join('\",\n    \"')}"\n  ],\n  "correctIndex": ${item.correctIndex}\n}\n\`\`\``;
 
-              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### 🎯 Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.triviaHeader}\n\n**Question:** ${item.question}\n\n**Answers:**\n${answers.map(function(a, idx) { return `${idx + 1}. ${a}`; }).join('\n')}\n\n**Correct Answer Index:** ${item.correctIndex}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 5).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(5).join('\n')}\n\n---\n\n${common.footer}`;
+              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### 🎯 Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.triviaHeader}\n\n**Question:** ${item.question}\n\n**Answers:**\n${answers.map(function(a, idx) { return `${idx + 1}. ${a}`; }).join('\n')}\n\n**Correct Answer Index:** ${item.correctIndex}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 4).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(4).join('\n')}\n\n---\n\n${common.footer}`;
 
               const triviaIndex = trivia.findIndex(function(q) { return q.id === item.id; });
               trivia[triviaIndex].issued = true;
@@ -691,15 +705,12 @@ jobs:
 
               const tmpl = t.grammar;
               const common = t.common;
-              issueTitle = tmpl.title
-                .replace('{emoji}', pickEmoji())
-                .replace('{id}', item.id);
-              issueTitle = addTitleAdjectives(issueTitle, tmpl.adjectives);
+              issueTitle = t.buildIssueTitle(pickEmoji(), tmpl.title.replace('{id}', item.id));
 
               const instructions = t.buildInstructions(tmpl.file, tmpl.itemType, tmpl.prTitle).map((instr, i) => `${i + 1}. ${instr.replace(/{id}/g, item.id)}`);
-              const codeBlock = `\`\`\`json\n${item.text}\n\`\`\``;
+              const codeBlock = `\`\`\`json\n"${item.text}"\n\`\`\``;
 
-              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### 🎯 Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.grammarHeader}\n\n> ${item.text}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 5).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(5).join('\n')}\n\n---\n\n${common.footer}`;
+              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### 🎯 Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.grammarHeader}\n\n> ${item.text}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 4).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(4).join('\n')}\n\n---\n\n${common.footer}`;
 
               const grammarIndex = grammar.findIndex(function(g) { return g.id === item.id; });
               grammar[grammarIndex].issued = true;
@@ -758,15 +769,12 @@ jobs:
 
               const tmpl = t.animeQuote;
               const common = t.common;
-              issueTitle = tmpl.title
-                .replace('{emoji}', pickEmoji())
-                .replace('{id}', item.id);
-              issueTitle = addTitleAdjectives(issueTitle, tmpl.adjectives);
+              issueTitle = t.buildIssueTitle(pickEmoji(), tmpl.title.replace('{id}', item.id));
 
               const instructions = t.buildInstructions(tmpl.file, tmpl.itemType, tmpl.prTitle).map((instr, i) => `${i + 1}. ${instr.replace(/{id}/g, item.id)}`);
               const codeBlock = `\`\`\`json\n{\n  \"japanese\": \"${item.japanese}\",\n  \"romaji\": \"${item.romaji}\",\n  \"english\": \"${item.english}\",\n  \"anime\": \"${item.anime}\",\n  \"character\": \"${item.character}\"\n}\n\`\`\``;
 
-              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### 🎯 Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.quoteHeader}\n\n| Japanese | Romaji | English |\n|----------|--------|---------|\n| **${item.japanese}** | ${item.romaji} | ${item.english} |\n\n**Anime:** ${item.anime}  \n**Character:** ${item.character}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 5).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(5).join('\n')}\n\n---\n\n${common.footer}`;
+              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### 🎯 Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.quoteHeader}\n\n| Japanese | Romaji | English |\n|----------|--------|---------|\n| **${item.japanese}** | ${item.romaji} | ${item.english} |\n\n**Anime:** ${item.anime}  \n**Character:** ${item.character}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 4).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(4).join('\n')}\n\n---\n\n${common.footer}`;
 
               const quoteIndex = animeQuotes.findIndex(function(q) { return q.id === item.id; });
               animeQuotes[quoteIndex].issued = true;
@@ -818,15 +826,12 @@ jobs:
 
               const tmpl = t.videoGameQuote;
               const common = t.common;
-              issueTitle = tmpl.title
-                .replace('{emoji}', pickEmoji())
-                .replace('{id}', item.id);
-              issueTitle = addTitleAdjectives(issueTitle, tmpl.adjectives);
+              issueTitle = t.buildIssueTitle(pickEmoji(), tmpl.title.replace('{id}', item.id));
 
               const instructions = t.buildInstructions(tmpl.file, tmpl.itemType, tmpl.prTitle).map((instr, i) => `${i + 1}. ${instr.replace(/{id}/g, item.id)}`);
               const codeBlock = `\`\`\`json\n{\n  "japanese": "${item.japanese}",\n  "romaji": "${item.romaji}",\n  "english": "${item.english}",\n  "game": "${item.game}",\n  "character": "${item.character}"\n}\n\`\`\``;
 
-              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.gameQuoteHeader}\n\n| Japanese | Romaji | English |\n|----------|--------|---------|\n| **${item.japanese}** | ${item.romaji} | ${item.english} |\n\n**Game:** ${item.game}  \n**Character:** ${item.character}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 5).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(5).join('\n')}\n\n---\n\n${common.footer}`;
+              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.gameQuoteHeader}\n\n| Japanese | Romaji | English |\n|----------|--------|---------|\n| **${item.japanese}** | ${item.romaji} | ${item.english} |\n\n**Game:** ${item.game}  \n**Character:** ${item.character}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 4).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(4).join('\n')}\n\n---\n\n${common.footer}`;
 
               const quoteIndex = videoGameQuotes.findIndex(function(q) { return q.id === item.id; });
               videoGameQuotes[quoteIndex].issued = true;
@@ -875,15 +880,12 @@ jobs:
 
               const tmpl = t.idiom;
               const common = t.common;
-              issueTitle = tmpl.title
-                .replace('{emoji}', pickEmoji())
-                .replace('{id}', item.id);
-              issueTitle = addTitleAdjectives(issueTitle, tmpl.adjectives);
+              issueTitle = t.buildIssueTitle(pickEmoji(), tmpl.title.replace('{id}', item.id));
 
               const instructions = t.buildInstructions(tmpl.file, tmpl.itemType, tmpl.prTitle).map((instr, i) => `${i + 1}. ${instr.replace(/{id}/g, item.id)}`);
               const codeBlock = `\`\`\`json\n{\n  "japanese": "${item.japanese}",\n  "romaji": "${item.romaji}",\n  "english": "${item.english}",\n  "meaning": "${item.meaning}"\n}\n\`\`\``;
 
-              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.idiomHeader}\n\n| Japanese | Romaji | English |\n|----------|--------|---------|\n| **${item.japanese}** | ${item.romaji} | ${item.english} |\n\n> **Meaning:** ${item.meaning}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 5).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(5).join('\n')}\n\n---\n\n${common.footer}`;
+              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.idiomHeader}\n\n| Japanese | Romaji | English |\n|----------|--------|---------|\n| **${item.japanese}** | ${item.romaji} | ${item.english} |\n\n> **Meaning:** ${item.meaning}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 4).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(4).join('\n')}\n\n---\n\n${common.footer}`;
 
               const idiomIndex = idioms.findIndex(function(i) { return i.id === item.id; });
               idioms[idiomIndex].issued = true;
@@ -932,15 +934,12 @@ jobs:
 
               const tmpl = t.regionalDialect;
               const common = t.common;
-              issueTitle = tmpl.title
-                .replace('{emoji}', pickEmoji())
-                .replace('{id}', item.id);
-              issueTitle = addTitleAdjectives(issueTitle, tmpl.adjectives);
+              issueTitle = t.buildIssueTitle(pickEmoji(), tmpl.title.replace('{id}', item.id));
 
               const instructions = t.buildInstructions(tmpl.file, tmpl.itemType, tmpl.prTitle).map((instr, i) => `${i + 1}. ${instr.replace(/{id}/g, item.id)}`);
               const codeBlock = `\`\`\`json\n{\n  "dialect": "${item.dialect}",\n  "standardJapanese": "${item.standardJapanese}",\n  "english": "${item.english}",\n  "region": "${item.region}",\n  "note": "${item.note}"\n}\n\`\`\``;
 
-              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.dialectHeader}\n\n| Dialect | Standard Japanese | English | Region |\n|---------|-------------------|---------|--------|\n| **${item.dialect}** | ${item.standardJapanese} | ${item.english} | ${item.region} |\n\n> **Note:** ${item.note}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 5).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(5).join('\n')}\n\n---\n\n${common.footer}`;
+              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.dialectHeader}\n\n| Dialect | Standard Japanese | English | Region |\n|---------|-------------------|---------|--------|\n| **${item.dialect}** | ${item.standardJapanese} | ${item.english} | ${item.region} |\n\n> **Note:** ${item.note}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 4).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(4).join('\n')}\n\n---\n\n${common.footer}`;
 
               const dialectIndex = regionalDialects.findIndex(function(d) { return d.id === item.id; });
               regionalDialects[dialectIndex].issued = true;
@@ -987,15 +986,12 @@ jobs:
 
               const tmpl = t.falseFriend;
               const common = t.common;
-              issueTitle = tmpl.title
-                .replace('{emoji}', pickEmoji())
-                .replace('{id}', item.id);
-              issueTitle = addTitleAdjectives(issueTitle, tmpl.adjectives);
+              issueTitle = t.buildIssueTitle(pickEmoji(), tmpl.title.replace('{id}', item.id));
 
               const instructions = t.buildInstructions(tmpl.file, tmpl.itemType, tmpl.prTitle).map((instr, i) => `${i + 1}. ${instr.replace(/{id}/g, item.id)}`);
               const codeBlock = `\`\`\`json\n{\n  "termA": "${item.termA}",\n  "termB": "${item.termB}",\n  "explanation": "${item.explanation}",\n  "example": "${item.example}"\n}\n\`\`\``;
 
-              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.falseFriendHeader}\n\n**Term A:** ${item.termA}  \n**Term B:** ${item.termB}\n\n> **Explanation:** ${item.explanation}\n> **Example:** ${item.example}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 5).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(5).join('\n')}\n\n---\n\n${common.footer}`;
+              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.falseFriendHeader}\n\n**Term A:** ${item.termA}  \n**Term B:** ${item.termB}\n\n> **Explanation:** ${item.explanation}\n> **Example:** ${item.example}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 4).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(4).join('\n')}\n\n---\n\n${common.footer}`;
 
               const falseFriendIndex = falseFriends.findIndex(function(f) { return f.id === item.id; });
               falseFriends[falseFriendIndex].issued = true;
@@ -1042,15 +1038,12 @@ jobs:
 
               const tmpl = t.culturalEtiquette;
               const common = t.common;
-              issueTitle = tmpl.title
-                .replace('{emoji}', pickEmoji())
-                .replace('{id}', item.id);
-              issueTitle = addTitleAdjectives(issueTitle, tmpl.adjectives);
+              issueTitle = t.buildIssueTitle(pickEmoji(), tmpl.title.replace('{id}', item.id));
 
               const instructions = t.buildInstructions(tmpl.file, tmpl.itemType, tmpl.prTitle).map((instr, i) => `${i + 1}. ${instr.replace(/{id}/g, item.id)}`);
               const codeBlock = `\`\`\`json\n{\n  "situation": "${item.situation}",\n  "do": "${item.do}",\n  "dont": "${item.dont}",\n  "note": "${item.note}"\n}\n\`\`\``;
 
-              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.etiquetteHeader}\n\n**Situation:** ${item.situation}\n\n- Do: ${item.do}\n- Avoid: ${item.dont}\n\n> **Note:** ${item.note}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 5).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(5).join('\n')}\n\n---\n\n${common.footer}`;
+              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.etiquetteHeader}\n\n**Situation:** ${item.situation}\n\n- Do: ${item.do}\n- Avoid: ${item.dont}\n\n> **Note:** ${item.note}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 4).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(4).join('\n')}\n\n---\n\n${common.footer}`;
 
               const etiquetteIndex = culturalEtiquette.findIndex(function(e) { return e.id === item.id; });
               culturalEtiquette[etiquetteIndex].issued = true;
@@ -1097,15 +1090,12 @@ jobs:
 
               const tmpl = t.exampleSentence;
               const common = t.common;
-              issueTitle = tmpl.title
-                .replace('{emoji}', pickEmoji())
-                .replace('{id}', item.id);
-              issueTitle = addTitleAdjectives(issueTitle, tmpl.adjectives);
+              issueTitle = t.buildIssueTitle(pickEmoji(), tmpl.title.replace('{id}', item.id));
 
               const instructions = t.buildInstructions(tmpl.file, tmpl.itemType, tmpl.prTitle).map((instr, i) => `${i + 1}. ${instr.replace(/{id}/g, item.id)}`);
               const codeBlock = `\`\`\`json\n{\n  "japanese": "${item.japanese}",\n  "romaji": "${item.romaji}",\n  "english": "${item.english}",\n  "jlpt": "${item.jlpt}"\n}\n\`\`\``;
 
-              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.sentenceHeader}\n\n| Japanese | Romaji | English | JLPT |\n|----------|--------|---------|------|\n| **${item.japanese}** | ${item.romaji} | ${item.english} | ${item.jlpt} |\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 5).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(5).join('\n')}\n\n---\n\n${common.footer}`;
+              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.sentenceHeader}\n\n| Japanese | Romaji | English | JLPT |\n|----------|--------|---------|------|\n| **${item.japanese}** | ${item.romaji} | ${item.english} | ${item.jlpt} |\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 4).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(4).join('\n')}\n\n---\n\n${common.footer}`;
 
               const sentenceIndex = exampleSentences.findIndex(function(e) { return e.id === item.id; });
               exampleSentences[sentenceIndex].issued = true;
@@ -1152,15 +1142,12 @@ jobs:
 
               const tmpl = t.commonMistake;
               const common = t.common;
-              issueTitle = tmpl.title
-                .replace('{emoji}', pickEmoji())
-                .replace('{id}', item.id);
-              issueTitle = addTitleAdjectives(issueTitle, tmpl.adjectives);
+              issueTitle = t.buildIssueTitle(pickEmoji(), tmpl.title.replace('{id}', item.id));
 
               const instructions = t.buildInstructions(tmpl.file, tmpl.itemType, tmpl.prTitle).map((instr, i) => `${i + 1}. ${instr.replace(/{id}/g, item.id)}`);
               const codeBlock = `\`\`\`json\n{\n  "wrong": "${item.wrong}",\n  "correct": "${item.correct}",\n  "explanation": "${item.explanation}"\n}\n\`\`\``;
 
-              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.mistakeHeader}\n\n**Wrong:** ${item.wrong}\n\n**Correct:** ${item.correct}\n\n> **Why:** ${item.explanation}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 5).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(5).join('\n')}\n\n---\n\n${common.footer}`;
+              issueBody = `${tmpl.header}\n\n**Category:** ${tmpl.category}  \n**Difficulty:** ${common.difficulty}  \n**Estimated Time:** ${tmpl.estimatedTime}\n\n---\n\n### Your Task\n\n${tmpl.taskDescription}\n\n${tmpl.mistakeHeader}\n\n**Wrong:** ${item.wrong}\n\n**Correct:** ${item.correct}\n\n> **Why:** ${item.explanation}\n\n${common.instructionsHeader}\n\n${instructions.slice(0, 4).join('\n')}\n\n${codeBlock}\n\n${instructions.slice(4).join('\n')}\n\n---\n\n${common.footer}`;
 
               const mistakeIndex = commonMistakes.findIndex(function(m) { return m.id === item.id; });
               commonMistakes[mistakeIndex].issued = true;
@@ -1173,6 +1160,23 @@ jobs:
                 break;
               }
             }
+
+            const backlogFileMap = {
+              theme: themeBacklogPath,
+              fact: factsBacklogPath,
+              proverb: proverbsBacklogPath,
+              haiku: haikuBacklogPath,
+              trivia: triviaBacklogPath,
+              grammar: grammarBacklogPath,
+              animeQuote: animeQuotesBacklogPath,
+              idiom: idiomsBacklogPath,
+              regionalDialect: regionalDialectsBacklogPath,
+              falseFriend: falseFriendsBacklogPath,
+              culturalEtiquette: culturalEtiquetteBacklogPath,
+              exampleSentence: exampleSentencesBacklogPath,
+              commonMistake: commonMistakesBacklogPath,
+              videoGameQuote: videoGameQuotesBacklogPath,
+            };
 
             if (!selectedType) {
               console.log('No available items found across all community backlogs.');
@@ -1200,11 +1204,40 @@ jobs:
               core.setOutput('reason', 'dry_run');
               core.setOutput('selected_type', selectedType);
               core.setOutput('should_commit', backlogChanged ? 'true' : 'false');
+              core.setOutput('backlog_file', backlogFileMap[selectedType] || 'community/backlog/');
               core.setOutput('notify_discord', 'false');
               return;
             }
 
-            const labels = templates.labels.newIssue;
+            // Randomly pick 2-3 labels from the secondary pool
+            function pickRandomLabels(pool, count) {
+              const shuffled = [...pool].sort(function() { return Math.random() - 0.5; });
+              return shuffled.slice(0, count);
+            }
+            const secondaryCount = 2 + Math.floor(Math.random() * 2); // 2 or 3
+            const selectedSecondary = pickRandomLabels(templates.labels.secondaryIssuePool, secondaryCount);
+            const labels = [...templates.labels.coreIssue, ...selectedSecondary];
+
+            // Prepend body preamble (§6.2.1–6.2.4: H1 header, badges, callout, metadata)
+            const preambleLabelMap = {
+              theme: item && item.name ? `Color Theme: ${item.name}` : 'Color Theme',
+              fact: 'Japan Fact',
+              proverb: 'Japanese Proverb',
+              haiku: 'Japanese Haiku',
+              trivia: 'Trivia Question',
+              grammar: 'Grammar Point',
+              animeQuote: 'Anime Quote',
+              videoGameQuote: 'Video Game Quote',
+              idiom: 'Japanese Idiom',
+              regionalDialect: 'Dialect Entry',
+              falseFriend: 'False Friend Pair',
+              culturalEtiquette: 'Etiquette Tip',
+              exampleSentence: 'Example Sentence',
+              commonMistake: 'Learner Mistake',
+            };
+            const preambleLabel = preambleLabelMap[selectedType] || selectedType;
+            const preambleId = selectedType !== 'theme' ? (item && item.id) : null;
+            issueBody = t.buildBodyPreamble(preambleLabel, preambleId) + issueBody;
             const resolvedMilestoneNumber = await resolveMilestoneNumber();
 
             const createIssuePayload = {
@@ -1212,7 +1245,6 @@ jobs:
               repo: context.repo.repo,
               title: issueTitle,
               body: issueBody,
-              labels: labels,
               type: 'Task'
             };
 
@@ -1224,36 +1256,8 @@ jobs:
 
             console.log(`Created issue #${response.data.number}: ${issueTitle}`);
 
-            // Add reaction for engagement signal (boosts sort:reactions ranking)
-            try {
-              await github.rest.reactions.createForIssue({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: response.data.number,
-                content: 'rocket'
-              });
-            } catch (e) {
-              console.log(`Could not add reaction: ${e.message}`);
-            }
-
-            // Add welcome comment for engagement signal (boosts sort:comments ranking)
-            try {
-              const welcomeComment = await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: response.data.number,
-                body: t.common.welcomeComment
-              });
-
-              await github.rest.reactions.createForIssueComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: welcomeComment.data.id,
-                content: t.common.welcomeCommentReaction || 'heart'
-              });
-            } catch (e) {
-              console.log(`Could not add welcome comment: ${e.message}`);
-            }
+            // Pass labels to the next step via output (labels/reactions/comments use GITHUB_TOKEN)
+            core.setOutput('issue_labels', labels.join(','));
 
             state.lastType = selectedType;
             state.lastRun = new Date().toISOString();
@@ -1270,19 +1274,111 @@ jobs:
             core.setOutput('consecutive_no_issue_runs', String(state.consecutiveNoIssueRuns));
             core.setOutput('should_commit', 'true');
             core.setOutput('notify_discord', 'false');
+            core.setOutput('backlog_file', backlogFileMap[selectedType] || 'community/backlog/');
 
-      - name: Commit backlog updates
+      - name: Apply labels, reactions, and welcome comment
+        if: steps.create-issue.outputs.issue_created == 'true'
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ steps.create-issue.outputs.issue_number }}
+          ISSUE_LABELS: ${{ steps.create-issue.outputs.issue_labels }}
+        with:
+          github-token: ${{ secrets.AUTOMATION_PR_TOKEN || secrets.GITHUB_TOKEN }}
+          script: |
+            const issueNumber = Number(process.env.ISSUE_NUMBER);
+            const labels = process.env.ISSUE_LABELS.split(',').filter(Boolean);
+            const templates = require('./.github/templates/messages.cjs');
+            const t = templates.issueCreation;
+            const reactionPool = ['+1', '-1', 'laugh', 'hooray', 'confused', 'heart', 'rocket', 'eyes'];
+
+            function pickRandomReactions(count) {
+              const shuffled = [...reactionPool].sort(function() { return Math.random() - 0.5; });
+              return shuffled.slice(0, Math.min(count, reactionPool.length));
+            }
+
+            // Apply labels
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                labels
+              });
+              console.log(`Applied labels: ${labels.join(', ')}`);
+            } catch (e) {
+              console.log(`Could not apply labels: ${e.message}`);
+            }
+
+            // Add five random unique reactions to issue
+            for (const content of pickRandomReactions(5)) {
+              try {
+                await github.rest.reactions.createForIssue({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  content
+                });
+              } catch (e) {
+                console.log(`Reaction ${content} failed: ${e.message}`);
+              }
+            }
+
+            // Add welcome comment and five random unique reactions on that comment
+            try {
+              const comment = await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: t.common.welcomeComment
+              });
+              for (const content of pickRandomReactions(5)) {
+                try {
+                  await github.rest.reactions.createForIssueComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    comment_id: comment.data.id,
+                    content
+                  });
+                } catch (reactionError) {
+                  console.log(`Welcome comment reaction ${content} failed: ${reactionError.message}`);
+                }
+              }
+            } catch (e) {
+              console.log(`Welcome comment failed: ${e.message}`);
+            }
+
+      - name: Commit backlog updates directly to main
         if: steps.create-issue.outputs.should_commit == 'true'
         run: |
+          git config user.name "てんとう虫"
+          git config user.email "reservecrate@gmail.com"
           git add community/backlog/
           if git diff --cached --quiet; then
-            echo "No backlog changes to commit."
+            echo "No backlog changes to commit"
             exit 0
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore(automation): mark item as issued"
-          git push
+          commit_msg="chore(automation): mark item as issued"
+          max_attempts=5
+          attempt=1
+          while [ "$attempt" -le "$max_attempts" ]; do
+            git commit -m "$commit_msg"
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              echo "Backlog push succeeded on attempt $attempt"
+              exit 0
+            fi
+            echo "Backlog push attempt $attempt failed; retrying..."
+            git rebase --abort || true
+            git fetch origin main
+            git reset --hard origin/main
+            git add community/backlog/
+            if git diff --cached --quiet; then
+              echo "No backlog changes remain after sync"
+              exit 0
+            fi
+            attempt=$((attempt + 1))
+          done
+          echo "Failed to push backlog updates after $max_attempts attempts"
+          exit 1
 
       - name: Notify Discord if no issues are being created
         if: steps.create-issue.outputs.notify_discord == 'true'

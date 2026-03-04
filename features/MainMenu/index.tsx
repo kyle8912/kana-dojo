@@ -319,7 +319,7 @@ const MainMenu = () => {
           ))}
         </div>
       </div>
-      <a
+      {/* <a
         href='https://vercel.com/oss'
         target='_blank'
         rel='noopener'
@@ -331,7 +331,7 @@ const MainMenu = () => {
           src='https://vercel.com/oss/program-badge.svg'
           className='h-8 w-auto p-1'
         />
-      </a>
+      </a> */}
       {/* {showBanner && (
         <NightlyBanner onSwitch={handleSwitch} onDismiss={handleDismiss} />
       )} */}

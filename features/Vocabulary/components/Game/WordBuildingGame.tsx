@@ -27,6 +27,7 @@ import {
   useWordBuildingActionKey,
 } from '@/shared/components/Game/wordBuildingShared';
 import WordBuildingTilesGrid from '@/shared/components/Game/WordBuildingTilesGrid';
+import useClassicSessionStore from '@/shared/store/useClassicSessionStore';
 
 const random = new Random();
 const adaptiveSelector = getGlobalAdaptiveSelector();
@@ -37,6 +38,11 @@ const containsKanji = (text: string): boolean => {
   return /[\u4E00-\u9FAF]/.test(text);
 };
 
+const normalizeOption = (value: string | undefined | null): string | null => {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+};
 
 interface VocabWordBuildingGameProps {
   selectedWordObjs: IVocabObj[];
@@ -59,6 +65,7 @@ const VocabWordBuildingGame = ({
   onCorrect: externalOnCorrect,
   onWrong: externalOnWrong,
 }: VocabWordBuildingGameProps) => {
+  const logAttempt = useClassicSessionStore(state => state.logAttempt);
   // Smart reverse mode - used when not controlled externally
   const {
     isReverse: internalIsReverse,
@@ -138,7 +145,7 @@ const VocabWordBuildingGame = ({
           word: '',
           wordObj: null as IVocabObj | null,
           correctAnswer: '',
-          allTiles: [] as string[],
+          allTiles: new Map<number, string>(),
           quizType: currentQuizType,
         };
       }
@@ -154,7 +161,7 @@ const VocabWordBuildingGame = ({
           word: '',
           wordObj: null as IVocabObj | null,
           correctAnswer: '',
-          allTiles: [] as string[],
+          allTiles: new Map<number, string>(),
           quizType: currentQuizType,
         };
       }
@@ -167,40 +174,59 @@ const VocabWordBuildingGame = ({
       }
 
       // Determine correct answer based on quiz type and mode
-      let correctAnswer: string;
-      let distractorSource: string[];
+      let correctAnswerRaw: string | undefined;
+      let distractorSourceRaw: Array<string | undefined>;
 
       if (effectiveQuizType === 'reading') {
         // Reading quiz: answer is always the reading
-        correctAnswer = selectedWordObj.reading;
-        distractorSource = selectedWordObjs
+        correctAnswerRaw = selectedWordObj.reading;
+        distractorSourceRaw = selectedWordObjs
           .filter(obj => obj.word !== selectedWord)
           .map(obj => obj.reading);
       } else {
         // Meaning quiz
         if (isReverse) {
           // Reverse: show meaning, answer is word
-          correctAnswer = selectedWord;
-          distractorSource = selectedWordObjs
+          correctAnswerRaw = selectedWord;
+          distractorSourceRaw = selectedWordObjs
             .filter(obj => obj.word !== selectedWord)
             .map(obj => obj.word);
         } else {
           // Normal: show word, answer is meaning
-          correctAnswer = selectedWordObj.meanings[0];
-          distractorSource = selectedWordObjs
+          correctAnswerRaw = selectedWordObj.meanings[0];
+          distractorSourceRaw = selectedWordObjs
             .filter(obj => obj.word !== selectedWord)
             .map(obj => obj.meanings[0]);
         }
       }
 
-      const distractors = distractorSource
+      const correctAnswer = normalizeOption(correctAnswerRaw);
+      if (!correctAnswer) {
+        return {
+          word: '',
+          wordObj: null as IVocabObj | null,
+          correctAnswer: '',
+          allTiles: new Map<number, string>(),
+          quizType: effectiveQuizType,
+        };
+      }
+
+      const distractors = distractorSourceRaw
+        .map(normalizeOption)
+        .filter((value): value is string => value !== null)
+        .filter(option => option !== correctAnswer)
+        .filter((option, idx, arr) => arr.indexOf(option) === idx)
         .sort(() => random.real(0, 1) - 0.5)
         .slice(0, distractorCount);
 
       // Shuffle all tiles
-      const allTiles = [correctAnswer, ...distractors].sort(
+      const sortedTiles = [correctAnswer, ...distractors].sort(
         () => random.real(0, 1) - 0.5,
       );
+      const allTiles = new Map<number, string>();
+      sortedTiles.forEach((char, i) => {
+        allTiles.set(i, char);
+      });
 
       return {
         word: selectedWord,
@@ -217,7 +243,8 @@ const VocabWordBuildingGame = ({
   const [questionData, setQuestionData] = useState(() =>
     generateQuestion(quizType),
   );
-  const [placedTiles, setPlacedTiles] = useState<string[]>([]);
+  const [promptSequence, setPromptSequence] = useState(0);
+  const [placedTileIds, setPlacedTileIds] = useState<number[]>([]);
   const [isChecking, setIsChecking] = useState(false);
   const [isCelebrating, setIsCelebrating] = useState(false);
   const [displayAnswerSummary, setDisplayAnswerSummary] = useState(false);
@@ -249,7 +276,8 @@ const VocabWordBuildingGame = ({
       const typeToUse = nextQuizType ?? quizType;
       const newQuestion = generateQuestion(typeToUse);
       setQuestionData(newQuestion);
-      setPlacedTiles([]);
+      setPromptSequence(prev => prev + 1);
+      setPlacedTileIds([]);
       setIsChecking(false);
       setIsCelebrating(false);
       setBottomBarState('check');
@@ -281,7 +309,7 @@ const VocabWordBuildingGame = ({
 
   // Handle Check button
   const handleCheck = useCallback(() => {
-    if (placedTiles.length === 0) return;
+    if (placedTileIds.length === 0) return;
 
     // Debounce: prevent rapid button presses
     const now = Date.now();
@@ -296,8 +324,10 @@ const VocabWordBuildingGame = ({
     setIsChecking(true);
 
     // Correct if exactly one tile placed and it matches the correct answer
+    const selectedTileChar = questionData.allTiles.get(placedTileIds[0]);
     const isCorrect =
-      placedTiles.length === 1 && placedTiles[0] === questionData.correctAnswer;
+      placedTileIds.length === 1 &&
+      selectedTileChar === questionData.correctAnswer;
 
     // Use the word object stored with the question (guaranteed to be correct)
     const selectedWordObj = questionData.wordObj;
@@ -347,6 +377,21 @@ const VocabWordBuildingGame = ({
       if (externalIsReverse === undefined) {
         decideNextReverseMode();
       }
+      logAttempt({
+        questionId: questionData.word,
+        questionPrompt: String(
+          questionData.quizType === 'meaning' && isReverse
+            ? questionData.wordObj?.meanings?.[0] ?? questionData.word
+            : questionData.word,
+        ),
+        expectedAnswers: [questionData.correctAnswer],
+        userAnswer: String(selectedTileChar ?? ''),
+        inputKind: 'word_building',
+        isCorrect: true,
+        timeTakenMs: answerTimeMs,
+        optionsShown: Array.from(questionData.allTiles.values()),
+        extra: { isReverse, quizType: questionData.quizType },
+      });
     } else {
       speedStopwatch.reset();
       playErrorTwice();
@@ -369,9 +414,23 @@ const VocabWordBuildingGame = ({
       }
 
       externalOnWrong?.();
+      logAttempt({
+        questionId: questionData.word,
+        questionPrompt: String(
+          questionData.quizType === 'meaning' && isReverse
+            ? questionData.wordObj?.meanings?.[0] ?? questionData.word
+            : questionData.word,
+        ),
+        expectedAnswers: [questionData.correctAnswer],
+        userAnswer: String(selectedTileChar ?? ''),
+        inputKind: 'word_building',
+        isCorrect: false,
+        optionsShown: Array.from(questionData.allTiles.values()),
+        extra: { isReverse, quizType: questionData.quizType },
+      });
     }
   }, [
-    placedTiles,
+    placedTileIds,
     questionData,
     playClick,
     playCorrect,
@@ -390,6 +449,8 @@ const VocabWordBuildingGame = ({
     externalIsReverse,
     decideNextReverseMode,
     recordReverseModeWrong,
+    logAttempt,
+    isReverse,
     addCorrectAnswerTime,
     recordAnswerTime,
     isReverse,
@@ -428,7 +489,7 @@ const VocabWordBuildingGame = ({
     lastActionTimeRef.current = now;
 
     playClick();
-    setPlacedTiles([]);
+    setPlacedTileIds([]);
     setIsChecking(false);
     setBottomBarState('check');
     speedStopwatch.reset();
@@ -437,7 +498,7 @@ const VocabWordBuildingGame = ({
 
   // Handle tile click - add or remove from placed tiles
   const handleTileClick = useCallback(
-    (char: string) => {
+    (id: number, _char: string) => {
       if (isChecking && bottomBarState !== 'wrong') return;
 
       playClick();
@@ -450,14 +511,13 @@ const VocabWordBuildingGame = ({
         speedStopwatch.start();
       }
 
-      // Toggle tile in placed tiles array
-      if (placedTiles.includes(char)) {
-        setPlacedTiles(prev => prev.filter(c => c !== char));
-      } else {
-        setPlacedTiles(prev => [...prev, char]);
-      }
+      setPlacedTileIds(prevIds =>
+        prevIds.includes(id)
+          ? prevIds.filter(tileId => tileId !== id)
+          : [...prevIds, id],
+      );
     },
-    [isChecking, bottomBarState, placedTiles, playClick],
+    [isChecking, bottomBarState, playClick],
   );
 
   // Not enough words
@@ -465,7 +525,7 @@ const VocabWordBuildingGame = ({
     return null;
   }
 
-  const canCheck = placedTiles.length > 0 && !isChecking;
+  const canCheck = placedTileIds.length > 0 && !isChecking;
   const showContinue = bottomBarState === 'correct';
   const showTryAgain = bottomBarState === 'wrong';
 
@@ -560,6 +620,8 @@ const VocabWordBuildingGame = ({
                       variant='icon-only'
                       size='sm'
                       className='bg-(--card-color) text-(--secondary-color)'
+                      autoPlay
+                      autoPlayTrigger={promptSequence}
                     />
                   )}
                 </motion.div>
@@ -568,7 +630,7 @@ const VocabWordBuildingGame = ({
 
             <WordBuildingTilesGrid
               allTiles={questionData.allTiles}
-              placedTiles={placedTiles}
+              placedTileIds={placedTileIds}
               onTileClick={handleTileClick}
               isTileDisabled={isChecking && bottomBarState !== 'wrong'}
               isCelebrating={isCelebrating}
@@ -590,7 +652,9 @@ const VocabWordBuildingGame = ({
                   : 'min-h-[5rem]',
               )}
               tilesContainerClassName={
-                isGlassMode ? 'rounded-xl bg-(--card-color) px-4 py-2' : undefined
+                isGlassMode
+                  ? 'rounded-xl bg-(--card-color) px-4 py-2'
+                  : undefined
               }
               tilesWrapperKey={questionData.word}
             />

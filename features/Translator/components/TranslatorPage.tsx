@@ -125,7 +125,7 @@ export default function TranslatorPage({ locale = 'en' }: TranslatorPageProps) {
 
       <section
         className={cn(
-          'rounded-xl border border-(--border-color) bg-(--card-color) p-4',
+          'hidden rounded-xl border border-(--border-color) bg-(--card-color) p-4',
           'grid gap-4 md:grid-cols-2',
         )}
         aria-label='Translator transparency details'

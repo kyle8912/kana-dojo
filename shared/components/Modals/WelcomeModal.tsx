@@ -20,10 +20,10 @@ import {
   isPremiumThemeId,
   getWallpaperStyles,
   getThemeDefaultWallpaperId,
-} from '@/features/Preferences/data/themes';
-import { getWallpaperById } from '@/features/Preferences/data/wallpapers';
-import fonts from '@/features/Preferences/data/fonts';
-import { isRecommendedFont } from '@/features/Preferences/data/recommendedFonts';
+} from '@/features/Preferences/data/themes/themes';
+import { getWallpaperById } from '@/features/Preferences/data/wallpapers/wallpapers';
+import fonts from '@/features/Preferences/data/fonts/fonts';
+import { isRecommendedFont } from '@/features/Preferences/data/fonts/recommendedFonts';
 import { useClick } from '@/shared/hooks/useAudio';
 import { cardBorderStyles } from '@/shared/lib/styles';
 import { ActionButton } from '@/shared/components/ui/ActionButton';
